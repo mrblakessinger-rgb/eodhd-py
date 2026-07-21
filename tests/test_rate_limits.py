@@ -1,5 +1,6 @@
 """Test rate limiting functionality"""
 
+import asyncio
 from typing import Any
 
 import aiohttp
@@ -9,6 +10,30 @@ from pytest_mock import MockerFixture
 from steindamm import MaxSleepExceededError, NoTokensAvailableError
 
 from eodhd_py.base import BaseEodhdApi, EodhdApiConfig
+
+
+@pytest.mark.asyncio
+async def test_concurrent_initialize_no_runtime_error_race() -> None:
+    """Concurrent initialize_rate_limiters must not raise RuntimeError."""
+    config = EodhdApiConfig(
+        api_key="demo",
+        daily_calls_rate_limit=50000,
+        daily_remaining_limit=4000,
+        minute_requests_rate_limit=100,
+        minute_remaining_limit=50,
+        extra_limit=0,
+    )
+    api = BaseEodhdApi(config=config)
+
+    async def _init_and_touch() -> None:
+        await config.initialize_rate_limiters(api.BASE_URL)
+        assert config.daily_rate_limiter is not None
+        assert config.minute_rate_limiter is not None
+        assert config._user_limits_initialized is True
+
+    await asyncio.gather(*[_init_and_touch() for _ in range(24)])
+    assert config._daily_rate_limiter is not None
+    assert config._minute_rate_limiter is not None
 
 
 @pytest.mark.asyncio
@@ -85,12 +110,7 @@ async def test_fetch_limits_only_once() -> None:
         api = BaseEodhdApi(config=config)
 
         with aioresponses() as mock_http:
-            # The AAPL call is made to populate API stats before fetching user info
-            mock_http.get(  # type: ignore
-                "https://eodhd.com/api/eod/AAPL?api_token=demo&fmt=json",
-                payload={"close": 100},
-            )
-
+            # Bootstrap is GET /user only (no dummy /eod/AAPL prime)
             mock_http.get(  # type: ignore
                 "https://eodhd.com/api/user?api_token=demo&fmt=json",
                 payload={"dailyRateLimit": "100000", "apiRequests": "1000"},
@@ -106,18 +126,15 @@ async def test_fetch_limits_only_once() -> None:
             for i in range(3):
                 await api._make_request(f"eod/TEST{i}", df_output=False)
 
-            # Verify _user_limits_initialized flag is True after requests
             assert config._user_limits_initialized is True
 
-            # Verify user API was called exactly once
             requests_dict: dict[Any, Any] = mock_http.requests  # type: ignore
             user_api_call_count = sum(1 for key in requests_dict if "/user" in str(key[1]))
             assert user_api_call_count == 1
+            assert sum(1 for key in requests_dict if "/eod/AAPL" in str(key[1])) == 0
 
-            # Verify rate limiters are initialized
             assert config._daily_rate_limiter is not None
             assert config._minute_rate_limiter is not None
-
             assert config._daily_rate_limiter.capacity == 100000
             assert config._daily_rate_limiter.initial_tokens == 99000  # 100000 - 1000 used
             assert config._minute_rate_limiter.capacity == 1400
@@ -168,14 +185,7 @@ async def test_config_partial_auto_fetch(
 
         api = BaseEodhdApi(config=config)
 
-        # Mock the user API response
         with aioresponses() as mock_http:
-            # The AAPL call is made to populate API stats before fetching user info
-            mock_http.get(  # type: ignore
-                "https://eodhd.com/api/eod/AAPL?api_token=demo&fmt=json",
-                payload={"close": 100},
-            )
-
             mock_http.get(  # type: ignore
                 "https://eodhd.com/api/user?api_token=demo&fmt=json",
                 payload={"dailyRateLimit": "200000", "apiRequests": "1000", "extraLimit": "1000"},

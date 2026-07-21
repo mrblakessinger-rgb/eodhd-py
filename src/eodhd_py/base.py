@@ -72,6 +72,7 @@ class EodhdApiConfig(BaseModel):
     _extra_rate_limiter: Any | None = None
     _minute_rate_limiter: Any | None = None
     _user_limits_initialized: bool = False
+    _rate_limit_init_lock: asyncio.Lock | None = None
 
     @property
     def session(self) -> aiohttp.ClientSession:
@@ -125,101 +126,111 @@ class EodhdApiConfig(BaseModel):
             raise RuntimeError(msg)
         return self._minute_rate_limiter
 
+    def _new_token_bucket(self, **kwargs: Any) -> Any:
+        """Build a steindamm async token bucket (supports steindamm 0.8 ctor and 0.9 .create)."""
+        factory = getattr(AsyncTokenBucket, "create", None)
+        if callable(factory):
+            return factory(**kwargs)
+        return AsyncTokenBucket(**kwargs)
+
     async def initialize_rate_limiters(self, base_url: str) -> None:
         """
         Fetch actual limits from user API and initialize rate limiters.
 
+        Concurrent callers are serialized so the initialized flag is only set after
+        limiters exist (avoids a RuntimeError race). When limits are auto-fetched,
+        only GET /user is used — a dummy EOD prime is not required.
+
         Args:
             base_url: The base URL for the API
-            force: If True, refetch limits even if already fetched (useful after 429 errors)
 
         """
-        if self._user_limits_initialized:
+        if self._user_limits_initialized and self._daily_rate_limiter is not None:
             return
 
-        self._user_limits_initialized = True
+        if self._rate_limit_init_lock is None:
+            self._rate_limit_init_lock = asyncio.Lock()
 
-        # Default limits
-        daily_limit = self.daily_calls_rate_limit if self.daily_calls_rate_limit is not None else 100000.0
-        daily_remaining_limit = self.daily_remaining_limit if self.daily_remaining_limit is not None else daily_limit
-        extra_limit = self.extra_limit if self.extra_limit is not None else 0.0
-        minute_limit = self.minute_requests_rate_limit if self.minute_requests_rate_limit is not None else 1400.0
-        minute_remaining_limit = (
-            self.minute_remaining_limit if self.minute_remaining_limit is not None else minute_limit
-        )
+        async with self._rate_limit_init_lock:
+            if self._user_limits_initialized and self._daily_rate_limiter is not None:
+                return
 
-        # Try to fetch actual limits from user API if not explicitly set
-        if self.daily_calls_rate_limit is None or self.minute_requests_rate_limit is None or self.extra_limit is None:
-            try:
-                # Make a simple EOD request first to populate user API values
-                params = {"api_token": self.api_key, "fmt": "json"}
-                eod_url = f"{base_url}/eod/AAPL"
-                async with self.session.request("GET", eod_url, params=params) as eod_response:
-                    eod_response.raise_for_status()
-                    await eod_response.json()
-
-                # Now fetch user info to get limits
-                url = f"{base_url}/user"
-                async with self.session.request("GET", url, params=params) as response:
-                    response.raise_for_status()
-                    user_info = await response.json()
-
-                    # Update daily rate limit if not explicitly set
-                    if self.daily_calls_rate_limit is None:
-                        daily_limit = int(user_info.get("dailyRateLimit", 100000))
-                        daily_remaining_limit = daily_limit - int(user_info.get("apiRequests", daily_limit))
-
-                    # Update extra limit if not explicitly set
-                    if self.extra_limit is None:
-                        extra_limit = int(user_info.get("extraLimit", 0))
-
-                    # Update minute rate limit if not explicitly set
-                    if self.minute_requests_rate_limit is None:
-                        minute_limit = int(response.headers.get("x-ratelimit-limit", 1400))
-                        minute_remaining_limit = int(response.headers.get("x-ratelimit-remaining", minute_limit))
-            except Exception as e:  # noqa: BLE001
-                # TODO: Remove once logging is added
-                print(f"Failed to fetch user limits: {e}. Using default or configured limits.")  # noqa: T201
-
-        api_key_hash = self.rate_limit_key or str(abs(hash(self.api_key)))[:8]  # Short hash for unique naming
-
-        # Daily limits reset at midnight GMT (UTC)
-        # Use naive datetime for compatibility with steindamm
-        now = datetime.now(UTC)
-        last_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
-
-        # Initialize rate limiters with fetched or default limits
-        self._daily_rate_limiter = AsyncTokenBucket(
-            connection=self.redis_connection,
-            name=f"eodhd_daily_{api_key_hash}",
-            capacity=daily_limit,
-            refill_frequency=86400,  # 24 hours in seconds
-            refill_amount=daily_limit,
-            initial_tokens=daily_remaining_limit,  # Start with remaining capacity
-            max_sleep=self.daily_max_sleep,  # Maximum time to wait for daily rate limit
-            expiry=86400 * 2,
-            window_start_time=last_midnight,
-        )
-        if extra_limit > 0:
-            # Extra limit - non-refilling token bucket
-            self._extra_rate_limiter = AsyncTokenBucket(
-                connection=self.redis_connection,
-                name=f"eodhd_extra_{api_key_hash}",
-                capacity=extra_limit,
-                refill_frequency=0,
-                refill_amount=0,
-                expiry=86400 * 2,
+            # Default limits (flag stays false until buckets are installed)
+            daily_limit = self.daily_calls_rate_limit if self.daily_calls_rate_limit is not None else 100000.0
+            daily_remaining_limit = (
+                self.daily_remaining_limit if self.daily_remaining_limit is not None else daily_limit
             )
-        self._minute_rate_limiter = AsyncTokenBucket(
-            connection=self.redis_connection,
-            name=f"eodhd_minute_{api_key_hash}",
-            capacity=minute_limit,
-            refill_frequency=1,  # every second
-            refill_amount=minute_limit / 60,
-            initial_tokens=minute_remaining_limit,  # Start with remaining capacity
-            max_sleep=self.minute_max_sleep,  # Maximum time to wait for minute rate limit
-            expiry=120,
-        )
+            extra_limit = self.extra_limit if self.extra_limit is not None else 0.0
+            minute_limit = self.minute_requests_rate_limit if self.minute_requests_rate_limit is not None else 1400.0
+            minute_remaining_limit = (
+                self.minute_remaining_limit if self.minute_remaining_limit is not None else minute_limit
+            )
+
+            # Fetch actual limits from user API if not explicitly set (no dummy ticker)
+            if (
+                self.daily_calls_rate_limit is None
+                or self.minute_requests_rate_limit is None
+                or self.extra_limit is None
+            ):
+                try:
+                    params = {"api_token": self.api_key, "fmt": "json"}
+                    url = f"{base_url}/user"
+                    async with self.session.request("GET", url, params=params) as response:
+                        response.raise_for_status()
+                        user_info = await response.json()
+
+                        if self.daily_calls_rate_limit is None:
+                            daily_limit = int(user_info.get("dailyRateLimit", 100000))
+                            daily_remaining_limit = daily_limit - int(user_info.get("apiRequests", daily_limit))
+
+                        if self.extra_limit is None:
+                            extra_limit = int(user_info.get("extraLimit", 0))
+
+                        if self.minute_requests_rate_limit is None:
+                            minute_limit = int(response.headers.get("x-ratelimit-limit", 1400))
+                            minute_remaining_limit = int(response.headers.get("x-ratelimit-remaining", minute_limit))
+                except Exception as e:  # noqa: BLE001
+                    # TODO: Remove once logging is added
+                    print(f"Failed to fetch user limits: {e}. Using default or configured limits.")  # noqa: T201
+
+            api_key_hash = self.rate_limit_key or str(abs(hash(self.api_key)))[:8]
+
+            # Daily limits reset at midnight GMT (UTC)
+            # Use naive datetime for compatibility with steindamm
+            now = datetime.now(UTC)
+            last_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+
+            self._daily_rate_limiter = self._new_token_bucket(
+                connection=self.redis_connection,
+                name=f"eodhd_daily_{api_key_hash}",
+                capacity=daily_limit,
+                refill_frequency=86400,  # 24 hours in seconds
+                refill_amount=daily_limit,
+                initial_tokens=daily_remaining_limit,
+                max_sleep=self.daily_max_sleep,
+                expiry=86400 * 2,
+                window_start_time=last_midnight,
+            )
+            if extra_limit > 0:
+                self._extra_rate_limiter = self._new_token_bucket(
+                    connection=self.redis_connection,
+                    name=f"eodhd_extra_{api_key_hash}",
+                    capacity=extra_limit,
+                    refill_frequency=0,
+                    refill_amount=0,
+                    expiry=86400 * 2,
+                )
+            self._minute_rate_limiter = self._new_token_bucket(
+                connection=self.redis_connection,
+                name=f"eodhd_minute_{api_key_hash}",
+                capacity=minute_limit,
+                refill_frequency=1,  # every second
+                refill_amount=minute_limit / 60,
+                initial_tokens=minute_remaining_limit,
+                max_sleep=self.minute_max_sleep,
+                expiry=120,
+            )
+            self._user_limits_initialized = True
 
 
 class BaseEodhdApi:
